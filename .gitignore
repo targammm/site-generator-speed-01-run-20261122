@@ -1,0 +1,6 @@
+# Local grading runs and profiling output, never part of the entry.
+out/
+answers.json
+*.cpuprofile
+*.log
+node_modules/
