@@ -16,10 +16,11 @@ function cmp(a, b) { return a < b ? -1 : a > b ? 1 : 0; }
 
 const AMP = 38, LT = 60, GT = 62, QUOT = 34, APOS = 39;
 
+const ESC_RE = /[&<>"']/;
+
 // HTML escape: & < > " ' only. Fast path when nothing needs escaping.
 function escInto(out, s) {
-  if (s.indexOf('&') < 0 && s.indexOf('<') < 0 && s.indexOf('>') < 0 &&
-      s.indexOf('"') < 0 && s.indexOf("'") < 0) { out.push(s); return; }
+  if (!ESC_RE.test(s)) { out.push(s); return; }
   let start = 0;
   for (let i = 0; i < s.length; i++) {
     const c = s.charCodeAt(i);
@@ -38,9 +39,38 @@ function escInto(out, s) {
   if (start < s.length) out.push(s.slice(start));
 }
 
+// Range form of escInto: escape s[a..b) without slicing it first. The five
+// indexOf scans are native and bounded to the range.
+function escRange(out, s, a, b) {
+  let i;
+  if (((i = s.indexOf('&', a)) < 0 || i >= b) &&
+      ((i = s.indexOf('<', a)) < 0 || i >= b) &&
+      ((i = s.indexOf('>', a)) < 0 || i >= b) &&
+      ((i = s.indexOf('"', a)) < 0 || i >= b) &&
+      ((i = s.indexOf("'", a)) < 0 || i >= b)) {
+    if (b > a) out.push(s.slice(a, b));
+    return;
+  }
+  let start = a;
+  for (let j = a; j < b; j++) {
+    const c = s.charCodeAt(j);
+    let rep = null;
+    if (c === AMP) rep = '&amp;';
+    else if (c === LT) rep = '&lt;';
+    else if (c === GT) rep = '&gt;';
+    else if (c === QUOT) rep = '&quot;';
+    else if (c === APOS) rep = '&#39;';
+    if (rep !== null) {
+      if (start < j) out.push(s.slice(start, j));
+      out.push(rep);
+      start = j + 1;
+    }
+  }
+  if (start < b) out.push(s.slice(start, b));
+}
+
 function esc(s) {
-  if (s.indexOf('&') < 0 && s.indexOf('<') < 0 && s.indexOf('>') < 0 &&
-      s.indexOf('"') < 0 && s.indexOf("'") < 0) return s;
+  if (!ESC_RE.test(s)) return s;
   const out = [];
   escInto(out, s);
   return out.join('');
@@ -599,9 +629,13 @@ function renderOps(ops, scope, ctx, out, depth) {
       const arr = resolvePath(scope, op[2]);
       if (Array.isArray(arr)) {
         const len = arr.length;
+        // One child scope reused across iterations: rendering is
+        // synchronous, so no iteration can observe another's values.
+        const child = { parent: scope, varName: op[1], varVal: undefined, loop: null, top: scope.top };
         for (let i = 0; i < len; i++) {
-          const loop = { index: i + 1, first: i === 0, last: i === len - 1, length: len };
-          renderOps(op[3], { parent: scope, varName: op[1], varVal: arr[i], loop, top: scope.top }, ctx, out, depth);
+          child.varVal = arr[i];
+          child.loop = { index: i + 1, first: i === 0, last: i === len - 1, length: len };
+          renderOps(op[3], child, ctx, out, depth);
         }
       }
     } else {
@@ -859,14 +893,21 @@ function tryLink(s, i, b, ctx, dir, sourcePath) {
   return { textStart: i + 1, textEnd, href: resolveLink(target, ctx, dir, sourcePath), end: targetEnd + 1 };
 }
 
+const INLINE_SPECIAL_RE = /[\\`*\[]/;
+
 function inlineRange(out, s, a, b, ctx, dir, sourcePath) {
+  if (b === a) return;
+  // Fast path: no markup character at all in the range — the scan below
+  // would only advance past plain text and escape the whole range.
+  const text = (a === 0 && b === s.length) ? s : s.slice(a, b);
+  if (!INLINE_SPECIAL_RE.test(text)) { escInto(out, text); return; }
   let i = a;
   let textStart = a;
   while (i < b) {
     const c = s.charCodeAt(i);
     if (c === 92) {
       if (i + 1 < b && isEscapableCode(s.charCodeAt(i + 1))) {
-        if (i > textStart) escInto(out, s.slice(textStart, i));
+        if (i > textStart) escRange(out, s, textStart, i);
         escInto(out, s[i + 1]);
         i += 2;
         textStart = i;
@@ -878,9 +919,9 @@ function inlineRange(out, s, a, b, ctx, dir, sourcePath) {
     if (c === 96) {
       const close = findCodeClose(s, i + 1, b);
       if (close > 0) {
-        if (i > textStart) escInto(out, s.slice(textStart, i));
+        if (i > textStart) escRange(out, s, textStart, i);
         out.push('<code>');
-        escInto(out, s.slice(i + 1, close));
+        escRange(out, s, i + 1, close);
         out.push('</code>');
         i = close + 1;
         textStart = i;
@@ -893,7 +934,7 @@ function inlineRange(out, s, a, b, ctx, dir, sourcePath) {
       if (i + 1 < b && s.charCodeAt(i + 1) === 42) {
         const close = findStrongClose(s, i + 2, b);
         if (close > 0) {
-          if (i > textStart) escInto(out, s.slice(textStart, i));
+          if (i > textStart) escRange(out, s, textStart, i);
           out.push('<strong>');
           inlineRange(out, s, i + 2, close, ctx, dir, sourcePath);
           out.push('</strong>');
@@ -906,7 +947,7 @@ function inlineRange(out, s, a, b, ctx, dir, sourcePath) {
       }
       const close = findEmClose(s, i + 1, b);
       if (close > 0) {
-        if (i > textStart) escInto(out, s.slice(textStart, i));
+        if (i > textStart) escRange(out, s, textStart, i);
         out.push('<em>');
         inlineRange(out, s, i + 1, close, ctx, dir, sourcePath);
         out.push('</em>');
@@ -920,7 +961,7 @@ function inlineRange(out, s, a, b, ctx, dir, sourcePath) {
     if (c === 91) {
       const link = tryLink(s, i, b, ctx, dir, sourcePath);
       if (link) {
-        if (i > textStart) escInto(out, s.slice(textStart, i));
+        if (i > textStart) escRange(out, s, textStart, i);
         out.push('<a href="');
         escInto(out, link.href);
         out.push('">');
@@ -935,7 +976,7 @@ function inlineRange(out, s, a, b, ctx, dir, sourcePath) {
     }
     i++;
   }
-  if (b > textStart) escInto(out, s.slice(textStart, b));
+  if (b > textStart) escRange(out, s, textStart, b);
 }
 
 // Render one body to HTML. Returns { html, toc, excerpt }.
@@ -968,7 +1009,7 @@ function renderMarkdown(body, ctx, sourceDir, sourcePath) {
             pos = e2 < 0 ? n + 1 : e2 + 1;
             break;
           }
-          escInto(out, body.slice(pos, le2));
+          escRange(out, body, pos, le2);
           out.push('\n');
           if (e2 < 0) { pos = n + 1; break; }
           pos = e2 + 1;
@@ -1114,7 +1155,8 @@ function slugifyCached(ctx, text) {
 }
 
 function isWSCode(c) {
-  return c === 32 || c === 9 || c === 10 || c === 11 || c === 12 || c === 13 ||
+  if (c === 32 || c === 9 || c === 10 || c === 13) return true;
+  return c === 11 || c === 12 ||
     c === 160 || c === 0x1680 || (c >= 0x2000 && c <= 0x200a) || c === 0x2028 ||
     c === 0x2029 || c === 0x202f || c === 0x205f || c === 0x3000 || c === 0xfeff;
 }
@@ -1179,7 +1221,8 @@ export function run(input) {
   for (let i = 0; i < sources.length; i++) {
     const f = sources[i];
     const path = f.path;
-    const content = f.content.replace(/\r\n/g, '\n').replace(/\r/g, '\n');
+    const rawContent = f.content;
+    const content = rawContent.indexOf('\r') < 0 ? rawContent : rawContent.replace(/\r\n/g, '\n').replace(/\r/g, '\n');
     const parsed = parseFrontMatter(content);
     if (parsed.error) {
       ctx.report.push('refused ' + path + ': ' + parsed.error);
